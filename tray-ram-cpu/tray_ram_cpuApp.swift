@@ -28,6 +28,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var ramMenu: NSMenu!
     var tempMenu: NSMenu!
     
+    // Store previous CPU ticks for delta calculation
+    var previousCPUTicks: [(user: Double, system: Double, nice: Double, idle: Double)] = []
+    
     // Add main to properly initialize NSApplication
     static func main() {
         let app = NSApplication.shared
@@ -40,14 +43,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Hide from Dock and don't show in Cmd+Tab - run as menu bar only app
         NSApp.setActivationPolicy(.accessory)
         
-        // Create CPU status bar item
-        cpuStatusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        // Create Temperature status bar item (leftmost)
+        tempStatusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         
-        // Create RAM status bar item
+        // Create RAM status bar item (middle)
         ramStatusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         
-        // Create Temperature status bar item
-        tempStatusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        // Create CPU status bar item (rightmost)
+        cpuStatusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         
         // Create separate menus for CPU, RAM, and Temperature
         cpuMenu = NSMenu()
@@ -70,13 +73,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         tempStatusItem.menu = tempMenu
         
         // Initialize displays
-        updateCPUDisplay(usage: 0)
-        updateRAMDisplay(usage: 0)
         updateTempDisplay(temp: 0)
+        updateRAMDisplay(usage: 0)
+        updateCPUDisplay(usage: 0)
         
-        // Start monitoring (update every 2 seconds, you can change this to 1 second if preferred)
+        // Start monitoring (update every 1 second)
         updateStats()
-        timer = Timer.scheduledTimer(timeInterval: 2.0, target: self, selector: #selector(updateStats), userInfo: nil, repeats: true)
+        timer = Timer.scheduledTimer(timeInterval: 1.0, target: self, selector: #selector(updateStats), userInfo: nil, repeats: true)
     }
     
     func updateCPUDisplay(usage: Double) {
@@ -96,8 +99,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             attributedString.append(NSAttributedString(attachment: cpuAttachment))
         }
         
-        // CPU Percentage
-        let cpuText = NSAttributedString(string: String(format: " %.0f%%", usage), attributes: [
+        // CPU Percentage (fixed-width format to prevent shifting, left-aligned)
+        let cpuText = NSAttributedString(string: String(format: " %-3.0f%%", usage), attributes: [
             .font: NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .regular)
         ])
         attributedString.append(cpuText)
@@ -121,8 +124,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             attributedString.append(NSAttributedString(attachment: ramAttachment))
         }
         
-        // RAM Percentage
-        let ramText = NSAttributedString(string: String(format: " %.0f%%", usage), attributes: [
+        // RAM Percentage (fixed-width format to prevent shifting, left-aligned)
+        let ramText = NSAttributedString(string: String(format: " %-3.0f%%", usage), attributes: [
             .font: NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .regular)
         ])
         attributedString.append(ramText)
@@ -146,8 +149,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             attributedString.append(NSAttributedString(attachment: tempAttachment))
         }
         
-        // Temperature in Celsius
-        let tempText = NSAttributedString(string: String(format: " %.0f°C", temp), attributes: [
+        // Temperature in Celsius (fixed-width format to prevent shifting, left-aligned)
+        let tempText = NSAttributedString(string: String(format: " %-3.0f°C", temp), attributes: [
             .font: NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .regular)
         ])
         attributedString.append(tempText)
@@ -160,9 +163,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let ramUsage = getRAMUsage()
         let cpuTemp = getCPUTemperature()
         
-        updateCPUDisplay(usage: cpuUsage)
-        updateRAMDisplay(usage: ramUsage)
         updateTempDisplay(temp: cpuTemp)
+        updateRAMDisplay(usage: ramUsage)
+        updateCPUDisplay(usage: cpuUsage)
     }
     
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -347,11 +350,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - CPU Usage
     func getCPUUsage() -> Double {
         var cpuInfo: processor_info_array_t!
-        let prevCpuInfo: processor_info_array_t? = nil
         var numCpuInfo: mach_msg_type_number_t = 0
-        let numPrevCpuInfo: mach_msg_type_number_t = 0
         var numCPUs: uint = 0
-        let CPUUsageLock: NSLock = NSLock()
         
         var totalUsage: Double = 0.0
         
@@ -364,11 +364,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         
-        CPUUsageLock.lock()
-        
         let result = host_processor_info(mach_host_self(), PROCESSOR_CPU_LOAD_INFO, &numCPUs, &cpuInfo, &numCpuInfo)
         
         if result == KERN_SUCCESS {
+            var currentTicks: [(user: Double, system: Double, nice: Double, idle: Double)] = []
+            
             for i in 0..<Int(numCPUs) {
                 let cpuLoadInfo = cpuInfo.advanced(by: Int(CPU_STATE_MAX) * i)
                 
@@ -377,29 +377,43 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 let nice = Double(cpuLoadInfo[Int(CPU_STATE_NICE)])
                 let idle = Double(cpuLoadInfo[Int(CPU_STATE_IDLE)])
                 
-                let total = user + system + nice + idle
-                
-                if total > 0 {
-                    let usage = ((user + system + nice) / total) * 100.0
-                    totalUsage += usage
-                }
+                currentTicks.append((user: user, system: system, nice: nice, idle: idle))
             }
             
-            totalUsage /= Double(numCPUs)
+            // Compare with previous ticks to get real-time delta usage
+            if previousCPUTicks.count == currentTicks.count {
+                for i in 0..<currentTicks.count {
+                    let userDelta = currentTicks[i].user - previousCPUTicks[i].user
+                    let systemDelta = currentTicks[i].system - previousCPUTicks[i].system
+                    let niceDelta = currentTicks[i].nice - previousCPUTicks[i].nice
+                    let idleDelta = currentTicks[i].idle - previousCPUTicks[i].idle
+                    
+                    let totalDelta = userDelta + systemDelta + niceDelta + idleDelta
+                    
+                    if totalDelta > 0 {
+                        let usage = ((userDelta + systemDelta + niceDelta) / totalDelta) * 100.0
+                        totalUsage += usage
+                    }
+                }
+                totalUsage /= Double(numCPUs)
+            }
+            
+            // Store current ticks for next comparison
+            previousCPUTicks = currentTicks
+            
+            // Deallocate the CPU info
+            let cpuInfoSize = vm_size_t(MemoryLayout<integer_t>.stride * Int(numCpuInfo))
+            vm_deallocate(mach_task_self_, vm_address_t(bitPattern: cpuInfo), cpuInfoSize)
         }
-        
-        if let prevCpuInfo = prevCpuInfo {
-            let prevCpuInfoSize: size_t = MemoryLayout<integer_t>.stride * Int(numPrevCpuInfo)
-            vm_deallocate(mach_task_self_, vm_address_t(bitPattern: prevCpuInfo), vm_size_t(prevCpuInfoSize))
-        }
-        
-        CPUUsageLock.unlock()
         
         return totalUsage
     }
     
     // MARK: - RAM Usage
     func getRAMUsage() -> Double {
+        let totalMemory = Double(ProcessInfo.processInfo.physicalMemory)
+        guard totalMemory > 0 else { return 0.0 }
+        
         var vmStats = vm_statistics64()
         var infoCount = mach_msg_type_number_t(MemoryLayout<vm_statistics64>.size / MemoryLayout<integer_t>.size)
         
@@ -410,111 +424,145 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         
         if result == KERN_SUCCESS {
-            let pageSize = vm_kernel_page_size
+            let pageSize = Double(vm_kernel_page_size)
             
-            // Calculate used memory
-            let usedPages = Int64(vmStats.active_count) +
-                           Int64(vmStats.inactive_count) +
-                           Int64(vmStats.wire_count)
-            
-            let usedMemory = Double(usedPages) * Double(pageSize)
-            
-            // Get total memory
-            var size = mach_msg_type_number_t(MemoryLayout<host_basic_info>.size / MemoryLayout<integer_t>.size)
-            var hostInfo = host_basic_info()
-            
-            let hostInfoResult = withUnsafeMutablePointer(to: &hostInfo) {
-                $0.withMemoryRebound(to: integer_t.self, capacity: Int(size)) {
-                    host_info(mach_host_self(), HOST_BASIC_INFO, $0, &size)
-                }
-            }
-            
-            if hostInfoResult == KERN_SUCCESS {
-                let totalMemory = Double(hostInfo.max_mem)
-                let usagePercentage = (usedMemory / totalMemory) * 100.0
-                return usagePercentage
-            }
+            // Memory Used = Total - Free - Cached Files
+            // free_count = truly free pages
+            // external_page_count = file-backed/cached pages (shown as "Cached Files" in Activity Monitor)
+            let freeAndCached = (Double(vmStats.free_count) + Double(vmStats.external_page_count)) * pageSize
+            let usedMemory = totalMemory - freeAndCached
+            let usagePercentage = (usedMemory / totalMemory) * 100.0
+            return usagePercentage
         }
         
         return 0.0
     }
     
-    // MARK: - CPU Temperature
-    func getCPUTemperature() -> Double {
-        // Try to read from IOKit thermal sensors
-        // This reads the thermal state which gives us a relative temperature indicator
-        var temperature: Double = 0.0
-        
-        // Method 1: Try powermetrics (most accurate but may require permissions)
-        if let temp = getTempFromPowermetrics() {
-            return temp
+    // MARK: - CPU Temperature via SMC
+    
+    // SMC data types and structures
+    struct SMCKeyData {
+        struct Vers {
+            var major: UInt8 = 0
+            var minor: UInt8 = 0
+            var build: UInt8 = 0
+            var reserved: UInt8 = 0
+            var release: UInt16 = 0
         }
         
-        // Method 2: Estimate based on CPU usage (fallback)
-        let cpuUsage = getCPUUsage()
-        // Estimate: idle ~45°C, full load ~85°C
-        temperature = 45.0 + (cpuUsage / 100.0) * 40.0
+        struct PLimitData {
+            var version: UInt16 = 0
+            var length: UInt16 = 0
+            var cpuPLimit: UInt32 = 0
+            var gpuPLimit: UInt32 = 0
+            var memPLimit: UInt32 = 0
+        }
+        
+        struct KeyInfo {
+            var dataSize: UInt32 = 0
+            var dataType: UInt32 = 0
+            var dataAttributes: UInt8 = 0
+        }
+        
+        var key: UInt32 = 0
+        var vers = Vers()
+        var pLimitData = PLimitData()
+        var keyInfo = KeyInfo()
+        var result: UInt8 = 0
+        var status: UInt8 = 0
+        var data8: UInt8 = 0
+        var data32: UInt32 = 0
+        var bytes: (UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+                     UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+                     UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+                     UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8) =
+            (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    }
+    
+    func fourCharCode(_ string: String) -> UInt32 {
+        var result: UInt32 = 0
+        for char in string.utf8 {
+            result = (result << 8) | UInt32(char)
+        }
+        return result
+    }
+    
+    func readSMCTemperature() -> Double? {
+        var conn: io_connect_t = 0
+        
+        // Use mach_port_t(0) which is the value of kIOMasterPortDefault/kIOMainPortDefault
+        let service = IOServiceGetMatchingService(mach_port_t(0), IOServiceMatching("AppleSMC"))
+        guard service != 0 else { return nil }
+        
+        let result = IOServiceOpen(service, mach_task_self_, 0, &conn)
+        IOObjectRelease(service)
+        guard result == kIOReturnSuccess else { return nil }
+        
+        defer { IOServiceClose(conn) }
+        
+        // Extended list of CPU temperature keys for different Mac models
+        // TC0P = CPU 1 Proximity, TC0D/TC0E/TC0F = CPU die temps
+        // TC1C/TC2C = CPU cores, TCAD = CPU A/D, TCXC = CPU Core
+        let tempKeys = ["TC0P", "TC0D", "TC0E", "TC0F", "TC1C", "TC2C", "TCAD", "TC0c", "TC1c", "TCXC", "TCXc"]
+        var temperatures: [Double] = []
+        
+        for key in tempKeys {
+            if let temp = readSMCKey(conn: conn, key: key), temp > 0 && temp < 120 {
+                temperatures.append(temp)
+            }
+        }
+        
+        guard !temperatures.isEmpty else { return nil }
+        
+        // Return average of all valid temperature readings
+        return temperatures.reduce(0, +) / Double(temperatures.count)
+    }
+    
+    func readSMCKey(conn: io_connect_t, key: String) -> Double? {
+        var inputData = SMCKeyData()
+        var outputData = SMCKeyData()
+        
+        inputData.key = fourCharCode(key)
+        inputData.data8 = 9 // kSMCGetKeyInfo
+        
+        var outputSize = MemoryLayout<SMCKeyData>.size
+        
+        // Get key info
+        let result1 = IOConnectCallStructMethod(conn, 2,
+                                                 &inputData, MemoryLayout<SMCKeyData>.size,
+                                                 &outputData, &outputSize)
+        guard result1 == kIOReturnSuccess else { return nil }
+        
+        // Read the value
+        inputData.keyInfo.dataSize = outputData.keyInfo.dataSize
+        inputData.data8 = 5 // kSMCReadKey
+        
+        let result2 = IOConnectCallStructMethod(conn, 2,
+                                                 &inputData, MemoryLayout<SMCKeyData>.size,
+                                                 &outputData, &outputSize)
+        guard result2 == kIOReturnSuccess else { return nil }
+        
+        // Convert SMC bytes to temperature (sp78 format: signed 7.8 fixed point)
+        let integerPart = Double(outputData.bytes.0)
+        let fractionalPart = Double(outputData.bytes.1) / 256.0
+        let temperature = integerPart + fractionalPart
         
         return temperature
     }
     
-    func getTempFromPowermetrics() -> Double? {
-        do {
-            let task = Process()
-            task.executableURL = URL(fileURLWithPath: "/usr/bin/powermetrics")
-            task.arguments = ["--samplers", "smc", "-i1", "-n1"]
-            
-            let pipe = Pipe()
-            task.standardOutput = pipe
-            task.standardError = Pipe()
-            
-            try task.run()
-            
-            // Set timeout
-            let timeoutDate = Date().addingTimeInterval(1.5)
-            while task.isRunning && Date() < timeoutDate {
-                Thread.sleep(forTimeInterval: 0.1)
-            }
-            
-            if task.isRunning {
-                task.terminate()
-            }
-            
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            
-            guard let output = String(data: data, encoding: .utf8) else {
-                return nil
-            }
-            
-            // Parse temperature from powermetrics output
-            // Look for lines like "CPU die temperature: 45.2 C"
-            var temperatures: [Double] = []
-            let lines = output.components(separatedBy: "\n")
-            
-            for line in lines {
-                if line.contains("temperature") && line.contains("C") {
-                    // Extract number before "C"
-                    let components = line.components(separatedBy: .whitespaces)
-                    for (index, component) in components.enumerated() {
-                        if component.lowercased() == "c" && index > 0 {
-                            if let temp = Double(components[index - 1]) {
-                                temperatures.append(temp)
-                            }
-                        }
-                    }
-                }
-            }
-            
-            // Return average temperature if found
-            if !temperatures.isEmpty {
-                return temperatures.reduce(0, +) / Double(temperatures.count)
-            }
-            
-            return nil
-            
-        } catch {
-            return nil
+    func getCPUTemperature() -> Double {
+        // Read directly from SMC hardware sensors
+        if let temp = readSMCTemperature() {
+            return temp
         }
+        
+        // Fallback: estimate based on CPU load
+        // This is less accurate but better than showing 0
+        let cpuUsage = getCPUUsage()
+        // Typical range: idle = 40°C, moderate = 60°C, high = 80°C
+        let estimatedTemp = 40.0 + (cpuUsage / 100.0) * 40.0
+        return estimatedTemp
     }
 }
 
